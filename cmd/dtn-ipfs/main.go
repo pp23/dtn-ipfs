@@ -14,11 +14,15 @@ import (
 
 	"github.com/ipfs/kubo/config"
 	"github.com/ipfs/kubo/core"
+	"github.com/ipfs/kubo/core/bootstrap"
 	"github.com/ipfs/kubo/core/coreapi"
 	"github.com/ipfs/kubo/core/node/libp2p"
 	"github.com/ipfs/kubo/plugin/loader"
 	"github.com/ipfs/kubo/repo/fsrepo"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+
+	"github.com/libp2p/go-libp2p/core/event"
 )
 
 func setupPlugins(externalPluginsPath string) error {
@@ -42,6 +46,8 @@ func createTempRepo() (string, error) {
 	}
 
 	cfg, err := config.Init(io.Discard, 2048)
+	// no initial peers for privacy, we will add our peers on demand
+	cfg.SetBootstrapPeers([]peer.AddrInfo{})
 	if err != nil {
 		return "", err
 	}
@@ -64,7 +70,15 @@ func createNode(ctx context.Context, repoPath string, online bool) (*core.IpfsNo
 		Routing: libp2p.DHTOption,
 		Repo:    repo,
 	}
-	return core.NewNode(ctx, nodeOptions)
+
+	node, err := core.NewNode(ctx, nodeOptions)
+	if err != nil {
+		return node, err
+	}
+	// no initial peers for privacy, we will add our peers on demand
+	bootstrapCfg := bootstrap.BootstrapConfigWithPeers([]peer.AddrInfo{})
+	err = node.Bootstrap(bootstrapCfg)
+	return node, err
 }
 
 var loadPluginsOnce sync.Once
@@ -138,19 +152,44 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Print(nodeA.Identity)
+	log.Print("[nodeA] Identity: ", nodeA.Identity)
 
 	rootPeerCidFile, err := ipfsA.Unixfs().Add(ctx, files.NewBytesFile([]byte("rootPeer data")))
 	if err != nil {
 		log.Panic(err)
 	}
 
-	log.Print("Added rootPeer file with CID ", rootPeerCidFile.String())
+	log.Print("[nodeA] Added file with CID ", rootPeerCidFile.String())
 
-	ipfsB, _, err := spawnEphemeral(ctx, true)
+	sub, err := nodeA.PeerHost.EventBus().Subscribe(new(event.EvtPeerIdentificationCompleted))
 	if err != nil {
 		log.Panic(err)
 	}
+
+	go func() {
+		defer sub.Close()
+		for e := range sub.Out() {
+			switch e := e.(type) {
+			case event.EvtPeerIdentificationCompleted:
+				log.Print("[nodeA] Identification completed: ", e.Peer)
+				log.Print("[nodeA] Peerstore: ", nodeA.Peerstore.Peers())
+			default:
+				log.Print("[nodeA] Unknown event type: ", e)
+			}
+		}
+	}()
+
+	var notifee network.NotifyBundle
+	notifee.ConnectedF = func(n network.Network, c network.Conn) {
+		log.Print("[nodeA] New connection from: ", c.RemotePeer())
+	}
+	nodeA.PeerHost.Network().Notify(&notifee)
+
+	ipfsB, nodeB, err := spawnEphemeral(ctx, true)
+	if err != nil {
+		log.Panic(err)
+	}
+	log.Print("[nodeB] Identity: ", nodeB.Identity)
 
 	rootPeerMa := "/ip4/127.0.0.1/tcp/4001/p2p/" + nodeA.Identity.String()
 
@@ -161,7 +200,7 @@ func main() {
 	go func() {
 		err := connectToPeers(ctx, ipfsB, bootstrapNodes)
 		if err != nil {
-			log.Print("failed connecto to peers: ", err)
+			log.Print("[nodeB] failed connecto to peers: ", err)
 		}
 	}()
 
