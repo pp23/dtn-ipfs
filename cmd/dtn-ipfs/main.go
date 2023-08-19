@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	icore "github.com/ipfs/boxo/coreiface"
+	icorepath "github.com/ipfs/boxo/coreiface/path"
 	"github.com/ipfs/boxo/files"
 	ma "github.com/multiformats/go-multiaddr"
 
@@ -48,6 +49,7 @@ func createTempRepo() (string, error) {
 	cfg, err := config.Init(io.Discard, 2048)
 	// no initial peers for privacy, we will add our peers on demand
 	cfg.SetBootstrapPeers([]peer.AddrInfo{})
+	cfg.Ipns.UsePubsub.WithDefault(true)
 	if err != nil {
 		return "", err
 	}
@@ -69,12 +71,17 @@ func createNode(ctx context.Context, repoPath string, online bool) (*core.IpfsNo
 		Online:  online,
 		Routing: libp2p.DHTOption,
 		Repo:    repo,
+		ExtraOpts: map[string]bool{
+			"pubsub": true,
+			"ipnsps": true,
+		},
 	}
 
 	node, err := core.NewNode(ctx, nodeOptions)
 	if err != nil {
 		return node, err
 	}
+
 	// no initial peers for privacy, we will add our peers on demand
 	bootstrapCfg := bootstrap.BootstrapConfigWithPeers([]peer.AddrInfo{})
 	err = node.Bootstrap(bootstrapCfg)
@@ -152,7 +159,32 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Print("[nodeA] Identity: ", nodeA.Identity)
+	log.Print("[nodeA] Identity: ", nodeA.Identity.Pretty())
+	key, err := ipfsA.Key().Self(ctx)
+	if err != nil {
+		log.Panic(err)
+	}
+	log.Print("[nodeA] SelfKey: ", key.ID())
+
+	if nodeA.PubSub == nil {
+		log.Panic("PubSub is nil")
+	}
+
+	subIpfs, err := nodeA.PubSub.Subscribe("/ipns")
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Print("[nodeA] Subscribed Topics: ", nodeA.PubSub.GetTopics())
+	go func() {
+		for {
+			msg, err := subIpfs.Next(ctx)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+			log.Print("[nodeA] Incoming message: ", msg.String())
+		}
+	}()
 
 	rootPeerCidFile, err := ipfsA.Unixfs().Add(ctx, files.NewBytesFile([]byte("rootPeer data")))
 	if err != nil {
@@ -160,6 +192,7 @@ func main() {
 	}
 
 	log.Print("[nodeA] Added file with CID ", rootPeerCidFile.String())
+	log.Print("[nodeA] Subscribed Topics: ", nodeA.PubSub.GetTopics())
 
 	sub, err := nodeA.PeerHost.EventBus().Subscribe(new(event.EvtPeerIdentificationCompleted))
 	if err != nil {
@@ -173,6 +206,11 @@ func main() {
 			case event.EvtPeerIdentificationCompleted:
 				log.Print("[nodeA] Identification completed: ", e.Peer)
 				log.Print("[nodeA] Peerstore: ", nodeA.Peerstore.Peers())
+				log.Print("[nodeA] Subscribed Topics: ", nodeA.PubSub.GetTopics())
+				_, err := ipfsA.Unixfs().Add(ctx, files.NewBytesFile([]byte("rootPeer data 3")))
+				if err != nil {
+					log.Panic(err)
+				}
 			default:
 				log.Print("[nodeA] Unknown event type: ", e)
 			}
@@ -191,19 +229,120 @@ func main() {
 	}
 	log.Print("[nodeB] Identity: ", nodeB.Identity)
 
+	/*	ipfsBChan, err := ipfsB.Name().Search(ctx, "")
+		if err != nil {
+			log.Panic(err)
+		}
+
+		go func() {
+			for {
+				select {
+				case ipnsResult := <-ipfsBChan:
+					log.Print("[nodeB] ipnsResult: ", ipnsResult)
+				}
+			}
+		}()
+	*/
+	go func() {
+		nodeAIpnsName := "/ipns/" + nodeA.Identity.String()
+		ipnsResult, err := nodeA.Namesys.Resolve(ctx, nodeAIpnsName)
+		if err != nil {
+			log.Panic(err)
+		}
+		log.Print("[nodeA] ", ipnsResult.String())
+	}()
+
+	subIpfsB, err := nodeB.PubSub.Subscribe("/ipfs")
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Print("[nodeB] Subscribed Topics: ", nodeB.PubSub.GetTopics())
+	go func() {
+		for {
+			msg, err := subIpfsB.Next(ctx)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+			log.Print("[nodeB] Incoming message: ", msg.String())
+		}
+	}()
+
 	rootPeerMa := "/ip4/127.0.0.1/tcp/4001/p2p/" + nodeA.Identity.String()
 
 	bootstrapNodes := []string{
 		rootPeerMa,
 	}
 
+	// ================== Get notified about new CIDs via Blockstore ==================================
+	// Blockstore allows to get a chan for all keys, which are Cids.
+	// Not sure, whether the cids are those which got added by nodeA
+	// as the one cid we see is pretty empty after write out
+	cidChan, err := nodeB.Blockstore.AllKeysChan(ctx)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	// finds at least one cid, but after write out, the file is empty
+	// furthermore, the channels first value is a valid cid, next cids string is only "b"...needs investigation
+	go func() {
+		for {
+			select {
+			case cid := <-cidChan:
+				log.Print("[nodeB] Got new CID: ", cid.String(), " :: ", cid.KeyString())
+				blocks, err := nodeB.Blockstore.Get(ctx, cid)
+				if err != nil {
+					log.Panic(err)
+				}
+				log.Print("[nodeB] cid string: ", blocks.String())
+				fNode, err := ipfsB.Dag().Get(ctx, cid)
+				if err != nil {
+					log.Panic(err)
+				}
+				log.Print("[nodeB] node data: ", fNode.String())
+				cidPath := icorepath.New(cid.String())
+				cidNode, err := ipfsB.Unixfs().Get(ctx, cidPath)
+				if err != nil {
+					log.Panic(err)
+				}
+				log.Print("[nodeB] node data: ", cidNode)
+				err = files.WriteTo(cidNode, "/tmp/test")
+				if err != nil {
+					log.Panic(err)
+				}
+				break
+			default:
+			}
+			break
+		}
+	}()
+	// ================================================================================================
+
 	go func() {
 		err := connectToPeers(ctx, ipfsB, bootstrapNodes)
 		if err != nil {
 			log.Print("[nodeB] failed connecto to peers: ", err)
 		}
+		sub, err := ipfsB.PubSub().Subscribe(ctx, "/ipns/"+nodeA.Identity.String())
+		if err != nil {
+			log.Panic(err)
+		}
+		go func() {
+			for {
+				msg, err := sub.Next(ctx)
+				if err != nil {
+					log.Panic(err)
+				}
+				log.Print("[nodeB] ", msg.From(), msg.Data())
+			}
+		}()
+		log.Print("[nodeB] Subscribed Topics: ", nodeB.PubSub.GetTopics())
+		f2, err2 := ipfsA.Unixfs().Add(ctx, files.NewBytesFile([]byte("rootPeer data 4")))
+		if err2 != nil {
+			log.Panic(err)
+		}
+		log.Print("[nodeA] Added file ", f2.String())
 	}()
 
-	var wait chan struct{}
-	<-wait
+	<-ctx.Done()
 }
