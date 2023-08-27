@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	icore "github.com/ipfs/boxo/coreiface"
@@ -143,6 +144,14 @@ func connectToPeers(ctx context.Context, ipfs icore.CoreAPI, peers []string) err
 	return nil
 }
 
+func MultiAddrsToString(addrs []ma.Multiaddr) []string {
+	var out []string
+	for _, addr := range addrs {
+		out = append(out, addr.String())
+	}
+	return out
+}
+
 func main() {
 	log.Print("Getting an IPFS node running")
 
@@ -154,6 +163,7 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Print("[nodeA] Identity: ", nodeA.Identity)
+	log.Print("[nodeA] Addresses: ", strings.Join(MultiAddrsToString(nodeA.PeerHost.Addrs()), "\n"))
 
 	rootPeerCidFile, err := ipfsA.Unixfs().Add(ctx, files.NewBytesFile([]byte("rootPeer data")))
 	if err != nil {
