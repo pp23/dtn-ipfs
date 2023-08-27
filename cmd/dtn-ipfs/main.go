@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
 
@@ -145,8 +146,8 @@ func connectToPeers(ctx context.Context, ipfs icore.CoreAPI, peers []string) err
 func main() {
 	log.Print("Getting an IPFS node running")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	ipfsA, nodeA, err := spawnEphemeral(ctx, true)
 	if err != nil {
@@ -204,6 +205,5 @@ func main() {
 		}
 	}()
 
-	var wait chan struct{}
-	<-wait
+	<-ctx.Done()
 }
