@@ -11,13 +11,17 @@ import (
 	"sync"
 
 	icore "github.com/ipfs/boxo/coreiface"
+	"github.com/ipfs/boxo/coreiface/options"
 	"github.com/ipfs/boxo/files"
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 
+	"github.com/ipfs/kubo/commands"
 	"github.com/ipfs/kubo/config"
 	"github.com/ipfs/kubo/core"
 	"github.com/ipfs/kubo/core/bootstrap"
 	"github.com/ipfs/kubo/core/coreapi"
+	"github.com/ipfs/kubo/core/corehttp"
 	"github.com/ipfs/kubo/core/node/libp2p"
 	"github.com/ipfs/kubo/plugin/loader"
 	"github.com/ipfs/kubo/repo/fsrepo"
@@ -27,18 +31,18 @@ import (
 	"github.com/libp2p/go-libp2p/core/event"
 )
 
-func setupPlugins(externalPluginsPath string) error {
+func setupPlugins(externalPluginsPath string) (*loader.PluginLoader, error) {
 	plugins, err := loader.NewPluginLoader(filepath.Join(externalPluginsPath, "plugins"))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := plugins.Initialize(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := plugins.Inject(); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return plugins, nil
 }
 
 func createTempRepo() (string, error) {
@@ -62,24 +66,83 @@ func createTempRepo() (string, error) {
 	return repoPath, nil
 }
 
-func createNode(ctx context.Context, repoPath string, online bool) (*core.IpfsNode, error) {
+func createNode(ctx context.Context, repoPath string, online bool, pluginLoader *loader.PluginLoader) (*core.IpfsNode, error) {
+	// create repo
 	repo, err := fsrepo.Open(repoPath)
 	if err != nil {
 		return nil, err
 	}
+	// create new identity
+	identity, err := config.CreateIdentity(os.Stdout, []options.KeyGenerateOption{
+		// options.Key.Size(),
+		options.Key.Type(options.Ed25519Key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	// create config
+	cfg, err := config.InitWithIdentity(identity)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SetBootstrapPeers([]peer.AddrInfo{}) // do not connect initially to other peers as this node should not be public
+	errCfg := repo.SetConfig(cfg)
+	if errCfg != nil {
+		return nil, errCfg
+	}
+
+	// create HTTP-API
+	apiAddr, err := ma.NewMultiaddr("/ip4/0.0.0.0/tcp/5001")
+	if err != nil {
+		return nil, err
+	}
+	apiListener, err := manet.Listen(apiAddr)
+	if err != nil {
+		return nil, err
+	}
+	repo.SetAPIAddr(apiAddr)
 	nodeOptions := &core.BuildCfg{
 		Online:  online,
 		Routing: libp2p.DHTOption,
 		Repo:    repo,
 	}
-
+	// create node
 	node, err := core.NewNode(ctx, nodeOptions)
 	if err != nil {
-		return node, err
+		return nil, err
 	}
 	// no initial peers for privacy, we will add our peers on demand
 	bootstrapCfg := bootstrap.BootstrapConfigWithPeers([]peer.AddrInfo{})
 	err = node.Bootstrap(bootstrapCfg)
+
+	// TODO: do we need everything here?
+	cctx := &commands.Context{
+		ConfigRoot: repoPath,
+		ReqLog:     &commands.ReqLog{},
+		Plugins:    pluginLoader,
+		ConstructNode: func() (*core.IpfsNode, error) {
+			return node, nil
+		},
+	}
+	// handle command request like /id request from ipfs-cluster
+	opts := []corehttp.ServeOption{
+		corehttp.CommandsOption(*cctx),
+	}
+
+	// serve the API
+	errc := make(chan error)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(lis manet.Listener) {
+		defer wg.Done()
+		errc <- corehttp.Serve(node, manet.NetListener(lis), opts...)
+	}(apiListener)
+
+	go func() {
+		wg.Wait()
+		close(errc)
+	}()
+
 	return node, err
 }
 
@@ -87,8 +150,10 @@ var loadPluginsOnce sync.Once
 
 func spawnEphemeral(ctx context.Context, online bool) (icore.CoreAPI, *core.IpfsNode, error) {
 	var onceErr error
+	var pluginLoader *loader.PluginLoader
+
 	loadPluginsOnce.Do(func() {
-		onceErr = setupPlugins("")
+		pluginLoader, onceErr = setupPlugins("")
 	})
 	if onceErr != nil {
 		return nil, nil, onceErr
@@ -99,7 +164,7 @@ func spawnEphemeral(ctx context.Context, online bool) (icore.CoreAPI, *core.Ipfs
 		return nil, nil, err
 	}
 
-	node, err := createNode(ctx, repoPath, online)
+	node, err := createNode(ctx, repoPath, online, pluginLoader)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -195,25 +260,6 @@ func main() {
 		log.Print("[nodeA] New connection from: ", c.RemotePeer())
 	}
 	nodeA.PeerHost.Network().Notify(&notifee)
-
-	ipfsB, nodeB, err := spawnEphemeral(ctx, true)
-	if err != nil {
-		log.Panic(err)
-	}
-	log.Print("[nodeB] Identity: ", nodeB.Identity)
-
-	rootPeerMa := "/ip4/127.0.0.1/tcp/4001/p2p/" + nodeA.Identity.String()
-
-	bootstrapNodes := []string{
-		rootPeerMa,
-	}
-
-	go func() {
-		err := connectToPeers(ctx, ipfsB, bootstrapNodes)
-		if err != nil {
-			log.Print("[nodeB] failed connecto to peers: ", err)
-		}
-	}()
 
 	<-ctx.Done()
 }
